@@ -1,0 +1,31 @@
+syntax = "proto3";
+package adminrpc;
+
+option go_package = "github.com/abhishekpdeshmukh/PAXOS-BANK-SIMULATOR/proto";
+
+
+service NodeService {
+    rpc Kill(AdminRequest) returns (NodeResponse) {}
+    rpc AcceptTransactions(TransactionRequest) returns(NodeResponse){}
+    rpc GetBalance(AdminRequest)returns (BalanceResponse){}
+}
+
+
+message AdminRequest {
+    string command = 1;
+}
+message NodeResponse {
+    string ack = 1;
+}
+
+message TransactionRequest{
+    int32 SetNumber =1;
+     int32 From =2;
+     int32 To =3;
+     int32 Amount =4;
+}
+
+message BalanceResponse {
+    int32 balance =1;
+    int32 serverId = 2;
+}
