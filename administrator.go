@@ -26,7 +26,7 @@ type Transaction struct {
 var transactions []Transaction
 
 func setUPClientRPC(id int) (pb.NodeServiceClient, context.Context, *grpc.ClientConn) {
-	fmt.Println("Executing: Kill Nodes")
+
 	conn, err := grpc.Dial("localhost:5005"+strconv.Itoa(id), grpc.WithInsecure(), grpc.WithBlock())
 	if err != nil {
 		log.Fatalf("Could not connect: %v", err)
@@ -34,7 +34,7 @@ func setUPClientRPC(id int) (pb.NodeServiceClient, context.Context, *grpc.Client
 	// defer conn.Close()
 	c := pb.NewNodeServiceClient(conn)
 
-	ctx, _ := context.WithTimeout(context.Background(), time.Second)
+	ctx, _ := context.WithTimeout(context.Background(), time.Second*10)
 	// defer cancel()
 	return c, ctx, conn
 }
@@ -143,14 +143,14 @@ func main() {
 			log.Printf(r.Ack)
 			conn.Close()
 		case 4:
-			fmt.Println("Executing: Print Balance on Specific Server")
+			// fmt.Println("Executing: Print Balance on Specific Server")
 			for i := 1; i < 5; i++ {
 				c, ctx, conn := setUPClientRPC(i)
 				r, err := c.GetBalance(ctx, &pb.AdminRequest{Command: "Die and Perish"})
 				if err != nil {
 					log.Fatalf("Could not add: %v", err)
 				}
-				log.Println(" Server ", r.ServerId, " Has Balance : ", r.Balance)
+				log.Println(" Server ", r.NodeID, " Has Balance : ", r.Balance)
 				conn.Close()
 			}
 		case 5:
