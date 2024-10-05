@@ -10,6 +10,35 @@ service NodeService {
     rpc GetBalance(AdminRequest)returns (BalanceResponse){}
 }
 
+service PaxosService {
+    rpc Prepare(PrepareRequest) returns (PromiseResponse){}
+    rpc Accept(AcceptRequest) returns (AcceptedResponse){}
+}
+
+message PrepareRequest {
+    Ballot ballot = 1;
+}
+
+message PromiseResponse {
+    Ballot ballot_number = 1;  // The ballot number n sent by the proposer
+    Ballot accept_num = 2;     // The latest accepted ballot number
+    repeated TransactionRequest accept_Val = 3;    // The latest accepted value (e.g., a set of transactions)
+    repeated TransactionRequest local =4;
+}
+
+  message AcceptRequest {
+    int32 proposalNumber = 1;  // The ballot number n for the proposal
+    repeated TransactionRequest value = 2;          // The proposed value (e.g., a set of transactions)
+}
+
+
+message AcceptedResponse {
+    int32 proposalNumber = 1;  // The ballot number n of the accepted proposal
+}
+
+
+
+
 
 message AdminRequest {
     string command = 1;
@@ -27,5 +56,11 @@ message TransactionRequest{
 
 message BalanceResponse {
     int32 balance =1;
-    int32 serverId = 2;
+    int32 nodeID = 2;
 }
+
+message Ballot {
+    int32 ballotNum = 1;
+    int32 nodeID = 2;
+}
+
