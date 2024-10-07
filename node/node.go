@@ -51,8 +51,7 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 	// 	Amount:    req.Amount),
 	// }
 	fmt.Println("Trying to Accept Transactions")
-	s.lock.Lock()
-	defer s.lock.Unlock()
+
 	if s.myBalance-int32(req.Amount) < 0 {
 		fmt.Println("Initiate consensus")
 		var wg sync.WaitGroup
@@ -72,38 +71,60 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 					if err != nil {
 						log.Fatalf("Could not add: %v", err)
 					}
+					// fmt.Println(promise)
+					s.lock.Lock()
 					for _, transaction := range promise.Accept_Val {
 						if transaction.To == s.nodeID {
 							s.myBalance += transaction.Amount
 						}
 					}
+					for _, transaction := range promise.Local {
+						if transaction.To == s.nodeID {
+							s.myBalance += transaction.Amount
+						}
+					}
+					fmt.Println("Printing Promise")
+					fmt.Println(promise)
 					s.megaBlock = append(s.megaBlock, promise.Accept_Val...)
 					s.megaBlock = append(s.megaBlock, promise.Local...)
+					s.megaBlock = append(s.megaBlock, s.transactionLog...)
+					s.megaBlock = append(s.megaBlock, req)
+					s.lock.Unlock()
 					conn.Close()
 				}
 			}(i)
 		}
 		wg.Wait()
-		// for i := 1; i <= 5; i++ {
-		// 	if i != int(s.nodeID) {
-		// 		c, ctx, conn := SetupNodeRpcReciever(i)
-		// 		accepted, err := c.Accept(ctx, &pb.AcceptRequest{
-		// 			ProposalNumber: s.currBallotNum,
-		// 			Value:          s.megaBlock,
-		// 		})
-		// 		if err != nil {
-		// 			log.Fatalf("Could not add: %v", err)
-		// 		}
-		// 		fmt.Println(accepted)
-		// 		conn.Close()
-		// 	}
+		wg.Add(4)
+		fmt.Println("MY MEGA BLOCK IS ")
+		fmt.Println(s.megaBlock)
+		for i := 1; i < 5; i++ {
+			go func(i int) {
+				defer wg.Done()
+				if i != int(s.nodeID) {
 
-		// }
-
-	} else {
+					c, ctx, conn := SetupNodeRpcReciever(i)
+					accepted, err := c.Accept(ctx, &pb.AcceptRequest{
+						ProposalNumber: s.currBallotNum,
+						Value:          s.megaBlock,
+					})
+					if err != nil {
+						log.Fatalf("Could not add: %v", err)
+					}
+					fmt.Println(accepted)
+					conn.Close()
+				}
+			}(i)
+		}
+		wg.Wait()
+	}
+	s.lock.Lock()
+	if s.myBalance-int32(req.Amount) >= 0 {
 		s.myBalance -= req.Amount
 		s.transactionLog = append(s.transactionLog, req)
+		fmt.Println("This my transaction log ", s.transactionLog)
 	}
+	s.lock.Unlock()
 	return &pb.NodeResponse{Ack: "Node " + strconv.Itoa(int(s.nodeID)) + " Took All transactions"}, nil
 }
 func (s *Node) Kill(ctx context.Context, req *pb.AdminRequest) (*pb.NodeResponse, error) {
@@ -130,29 +151,45 @@ func (s *Node) GetBalance(ctx context.Context, req *pb.AdminRequest) (*pb.Balanc
 func (s *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.PromiseResponse, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	if s.isPromised && compareBallot(s, req) {
-		s.promisedBallot = req.Ballot
-		return &pb.PromiseResponse{
-			BallotNumber: req.Ballot,
-			AcceptNum:    s.promisedBallot,
-			Accept_Val:   s.AcceptedTransactions,
-			Local:        s.transactionLog,
-		}, nil
-	} else if !s.isPromised && (s.currBallotNum < req.Ballot.BallotNum || s.currBallotNum == req.Ballot.BallotNum && s.nodeID < req.Ballot.NodeID) {
-		return &pb.PromiseResponse{
-			BallotNumber: req.Ballot, // Promise on the received ballot number
-			AcceptNum:    nil,        // No previously accepted ballot
-			Accept_Val:   nil,        // No previously accepted values
-			Local:        s.transactionLog,
-		}, nil
-	}
-	return &pb.PromiseResponse{}, fmt.Errorf("Prepare request rejected; higher or equal ballot number exists")
+
+	// if s.isPromised && compareBallot(s, req) {
+	fmt.Println("AcceptedTransactions: ", s.AcceptedTransactions)
+	fmt.Println("TransactionLog: ", s.transactionLog)
+
+	s.promisedBallot = req.Ballot
+	return &pb.PromiseResponse{
+		BallotNumber: req.Ballot,
+		AcceptNum:    s.promisedBallot,
+		Accept_Val:   s.AcceptedTransactions,
+		Local:        s.transactionLog,
+	}, nil
+
+	// } else if !s.isPromised && (s.currBallotNum < req.Ballot.BallotNum || s.currBallotNum == req.Ballot.BallotNum && s.nodeID < req.Ballot.NodeID) {
+	// 	return &pb.PromiseResponse{
+	// 		BallotNumber: req.Ballot, // Promise on the received ballot number
+	// 		AcceptNum:    nil,        // No previously accepted ballot
+	// 		Accept_Val:   nil,        // No previously accepted values
+	// 		Local:        s.transactionLog,
+	// 	}, nil
+	// }
+	// return &pb.PromiseResponse{}, fmt.Errorf("Prepare request rejected; higher or equal ballot number exists")
 
 }
 
 func (s *Node) Accept(ctx context.Context, req *pb.AcceptRequest) (*pb.AcceptedResponse, error) {
-
-	return &pb.AcceptedResponse{}, nil
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	fmt.Println("Inside Accept")
+	// if req.ProposalNumber >= s.currBallotNum {
+	fmt.Println(req.Value)
+	for _, transaction := range req.Value {
+		if transaction.To == s.nodeID {
+			s.myBalance += transaction.Amount
+		}
+	}
+	return &pb.AcceptedResponse{ProposalNumber: req.ProposalNumber}, nil
+	// }
+	// return &pb.AcceptedResponse{}, nil
 }
 
 func main() {
