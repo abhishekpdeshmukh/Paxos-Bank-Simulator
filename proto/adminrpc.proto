@@ -8,6 +8,7 @@ service NodeService {
     rpc Kill(AdminRequest) returns (NodeResponse) {}
     rpc AcceptTransactions(TransactionRequest) returns(NodeResponse){}
     rpc GetBalance(AdminRequest)returns (BalanceResponse){}
+    rpc Revive(ReviveRequest)returns(ReviveResponse){}
 }
 
 service PaxosService {
@@ -16,6 +17,12 @@ service PaxosService {
     rpc Commit(CommitRequest) returns (CommitedResponse){}
 }
 
+message ReviveRequest{
+    int32 nodeID = 1;
+}
+message ReviveResponse{
+    bool success = 1;
+}
 message CommitRequest{
     Ballot ballot_number =1;
 }
