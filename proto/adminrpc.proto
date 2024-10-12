@@ -1,7 +1,7 @@
 syntax = "proto3";
 package adminrpc;
 
-option go_package = "github.com/abhishekpdeshmukh/PAXOS-BANK-SIMULATOR/proto";
+option go_package = "/";
 
 
 service NodeService {
@@ -13,8 +13,15 @@ service NodeService {
 service PaxosService {
     rpc Prepare(PrepareRequest) returns (PromiseResponse){}
     rpc Accept(AcceptRequest) returns (AcceptedResponse){}
+    rpc Commit(CommitRequest) returns (CommitedResponse){}
 }
 
+message CommitRequest{
+    Ballot ballot_number =1;
+}
+message CommitedResponse {
+    bool success = 1;
+}
 message PrepareRequest {
     Ballot ballot = 1;
 }
@@ -23,7 +30,7 @@ message PromiseResponse {
     Ballot ballot_number = 1;  // The ballot number n sent by the proposer
     Ballot accept_num = 2;     // The latest accepted ballot number
     repeated TransactionRequest accept_Val = 3;    // The latest accepted value (e.g., a set of transactions)
-    repeated TransactionRequest local =4;
+    repeated TransactionRequest local = 4;
 }
 
   message AcceptRequest {
@@ -49,9 +56,10 @@ message NodeResponse {
 
 message TransactionRequest{
     int32 SetNumber =1;
-     int32 From =2;
-     int32 To =3;
-     int32 Amount =4;
+    int32 Id =2;
+    int32 From =3;
+    int32 To =4;
+    int32 Amount =5;
 }
 
 message BalanceResponse {
@@ -63,4 +71,17 @@ message Ballot {
     int32 ballotNum = 1;
     int32 nodeID = 2;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
