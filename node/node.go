@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -38,14 +37,15 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 
 	fmt.Println("Trying to Accept Transactions")
 
-	if s.myBalance-int32(req.Amount) < 0 {
+	if s.myBalance-int32(req.Amount) < 0 && s.isActive {
 		fmt.Println("Initiate consensus")
 		var wg sync.WaitGroup
-		wg.Add(4)
+		wg.Add(5)
 		s.currBallotNum += 1
-		for i := 1; i < 5; i++ {
+		for i := 1; i <= 5; i++ {
 			go func(i int, s *Node) {
 				if i != int(s.nodeID) {
+					fmt.Println("Inside Prepare")
 					c, ctx, conn := SetupNodeRpcReciever(i)
 					promise, err := c.Prepare(ctx, &pb.PrepareRequest{
 						Ballot: &pb.Ballot{
@@ -76,11 +76,13 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 					s.lock.Unlock()
 					conn.Close()
 				}
-				defer wg.Done()
+				wg.Done()
 			}(i, s)
 		}
+		fmt.Println("outside Prepare")
 		wg.Wait()
-		wg.Add(4)
+		fmt.Println("Really outside Prepare")
+		wg.Add(5)
 		s.lock.Lock()
 		s.megaBlock = append(s.megaBlock, s.transactionLog...)
 		s.megaBlock = append(s.megaBlock, req)
@@ -88,10 +90,11 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 		fmt.Println("MY MEGA BLOCK IS ")
 
 		fmt.Println(s.megaBlock)
-		for i := 1; i < 5; i++ {
+		for i := 1; i <= 5; i++ {
 			go func(i int) {
-				defer wg.Done()
+
 				if i != int(s.nodeID) {
+					fmt.Println("Inside Accept")
 
 					c, ctx, conn := SetupNodeRpcReciever(i)
 					accepted, err := c.Accept(ctx, &pb.AcceptRequest{
@@ -104,15 +107,16 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 					fmt.Println(accepted)
 					conn.Close()
 				}
+				defer wg.Done()
 			}(i)
 		}
 		wg.Wait()
-		wg.Add(4)
-		for i := 1; i < 5; i++ {
+		wg.Add(5)
+		for i := 1; i <= 5; i++ {
 			go func(i int) {
-				defer wg.Done()
-				if i != int(s.nodeID) {
 
+				if i != int(s.nodeID) {
+					fmt.Println("Inside Commit")
 					c, ctx, conn := SetupNodeRpcReciever(i)
 					ack, err := c.Commit(ctx, &pb.CommitRequest{
 						BallotNumber: &pb.Ballot{
@@ -127,6 +131,7 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 					fmt.Println(ack)
 					conn.Close()
 				}
+				defer wg.Done()
 			}(i)
 		}
 		wg.Wait()
@@ -159,15 +164,25 @@ func (s *Node) Kill(ctx context.Context, req *pb.AdminRequest) (*pb.NodeResponse
 	}
 }
 
+func (s *Node) Revive(ctx context.Context, req *pb.ReviveRequest) (*pb.ReviveResponse, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.isActive = true
+	return &pb.ReviveResponse{
+		Success: true,
+	}, nil
+}
+
 func (s *Node) GetBalance(ctx context.Context, req *pb.AdminRequest) (*pb.BalanceResponse, error) {
 	println(req.Command)
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	if s.isActive {
-		return &pb.BalanceResponse{Balance: int32(s.myBalance), NodeID: int32(s.nodeID)}, nil
-	} else {
-		return nil, errors.New(" am not alive")
-	}
+	// if s.isActive {
+
+	// } else {
+	// 	return
+	// }
+	return &pb.BalanceResponse{Balance: int32(s.myBalance), NodeID: int32(s.nodeID)}, nil
 }
 
 func (s *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.PromiseResponse, error) {
@@ -176,6 +191,7 @@ func (s *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Promise
 	fmt.Println("AcceptedTransactions: ", s.AcceptedMegaBlock)
 	fmt.Println("TransactionLog: ", s.transactionLog)
 	s.promisedBallot = req.Ballot
+	s.currBallotNum = req.Ballot.BallotNum
 	if s.isPromised && compareBallot(s, req) {
 		s.isPromised = true
 		return &pb.PromiseResponse{
@@ -184,7 +200,8 @@ func (s *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Promise
 			Accept_Val:   s.AcceptedMegaBlock,
 			Local:        s.transactionLog,
 		}, nil
-	} else if !s.isPromised && (s.currBallotNum < req.Ballot.BallotNum || s.currBallotNum == req.Ballot.BallotNum && s.nodeID < req.Ballot.NodeID) {
+	} else if !s.isPromised && (s.currBallotNum < req.Ballot.BallotNum || s.currBallotNum == req.Ballot.BallotNum) {
+		// && s.nodeID < req.Ballot.NodeID
 		s.isPromised = true
 		return &pb.PromiseResponse{
 			BallotNumber: req.Ballot, // Promise on the received ballot number
@@ -216,16 +233,20 @@ func (s *Node) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitedR
 	defer s.lock.Unlock()
 	fmt.Println("Inside Commit")
 	s.sortTransactions()
-	for _, transaction := range s.AcceptedMegaBlock {
-		if transaction.To == s.nodeID {
-			s.myBalance += transaction.Amount
-		}
-	}
+
 	if s.promisedBallot.BallotNum == req.BallotNumber.BallotNum {
+		for _, transaction := range s.AcceptedMegaBlock {
+			if transaction.To == s.nodeID {
+				s.myBalance += transaction.Amount
+			}
+		}
+
 		err := s.commitTransactions(false) // Commit transactions to the database
 		if err != nil {
 			return nil, err
 		}
+		s.AcceptedMegaBlock = nil
+		s.isPromised = false
 		return &pb.CommitedResponse{
 			Success: true,
 		}, nil
@@ -301,7 +322,7 @@ func main() {
 	currNode := &Node{
 		nodeID:         int32(id),
 		isActive:       true,
-		myBalance:      200,
+		myBalance:      100,
 		currBallotNum:  0,
 		promisedBallot: &pb.Ballot{},
 		lock:           sync.Mutex{},
@@ -317,7 +338,7 @@ func main() {
 }
 
 func SetupNodeRpcSender(id int, node *Node) {
-	lis, err := net.Listen("tcp", ":5005"+strconv.Itoa(id+5))
+	lis, err := net.Listen("tcp", ":"+strconv.Itoa((5005+id+5)))
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
@@ -330,8 +351,8 @@ func SetupNodeRpcSender(id int, node *Node) {
 }
 
 func SetupNodeRpcReciever(id int) (pb.PaxosServiceClient, context.Context, *grpc.ClientConn) {
-	fmt.Println("Setting Up RPC Reciever")
-	conn, err := grpc.Dial("localhost:5005"+strconv.Itoa(id+5), grpc.WithInsecure(), grpc.WithBlock())
+	// fmt.Println("Setting Up RPC Reciever")
+	conn, err := grpc.Dial("localhost:"+strconv.Itoa((5005+id+5)), grpc.WithInsecure(), grpc.WithBlock())
 	if err != nil {
 		log.Fatalf("Could not connect: %v", err)
 	}
