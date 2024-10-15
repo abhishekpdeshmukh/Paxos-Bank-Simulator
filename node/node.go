@@ -38,120 +38,157 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 	fmt.Println("Trying to Accept Transactions")
 
 	if s.myBalance-int32(req.Amount) < 0 && s.isActive {
-		fmt.Println("Initiate consensus")
-		var wg sync.WaitGroup
-		wg.Add(5)
+		var flag bool = true
 		s.currBallotNum += 1
-		for i := 1; i <= 5; i++ {
-			go func(i int, s *Node) {
-				if i != int(s.nodeID) {
-					fmt.Println("Inside Prepare")
-					c, ctx, conn := SetupNodeRpcReciever(i)
-					promise, err := c.Prepare(ctx, &pb.PrepareRequest{
-						Ballot: &pb.Ballot{
-							BallotNum: s.currBallotNum,
-							NodeID:    s.nodeID,
-						},
-					})
-					if err != nil {
-						log.Fatalf("Could not add: %v", err)
-					}
-					fmt.Println("Promise From ", i)
-					fmt.Println(promise)
-					s.lock.Lock()
-					for _, transaction := range promise.Accept_Val {
-						if transaction.To == s.nodeID {
-							s.myBalance += transaction.Amount
+		for {
+			fmt.Println("Inside Infinite Loop")
+			fmt.Println("Initiate consensus")
+			var wg sync.WaitGroup
+			wg.Add(5)
+			tempBalance := 0
+			fail := 0
+			for i := 1; i <= 5; i++ {
+				go func(i int, s *Node) {
+					if i != int(s.nodeID) {
+						fmt.Println("Inside Prepare")
+						c, ctx, conn := SetupNodeRpcReciever(i)
+						promise, err := c.Prepare(ctx, &pb.PrepareRequest{
+							Ballot: &pb.Ballot{
+								BallotNum: s.currBallotNum,
+								NodeID:    s.nodeID,
+							},
+						})
+						if err != nil {
+							if promise.BallotNumber.BallotNum != s.currBallotNum {
+								s.currBallotNum = promise.AcceptNum.BallotNum
+							}
+							fail++
+							// log.Fatalf("Could not add: %v", err)
+						} else {
+							fmt.Println("Promise From ", i)
+							fmt.Println(promise)
+							s.lock.Lock()
+							for _, transaction := range promise.Accept_Val {
+								if transaction.To == s.nodeID {
+									// s.myBalance += transaction.Amount
+									tempBalance += int(transaction.Amount)
+								}
+							}
+							for _, transaction := range promise.Local {
+								if transaction.To == s.nodeID {
+									// s.myBalance += transaction.Amount
+									tempBalance += int(transaction.Amount)
+								}
+							}
+							fmt.Println("Printing Promise")
+							fmt.Println(promise)
+							s.megaBlock = append(s.megaBlock, promise.Accept_Val...)
+							s.megaBlock = append(s.megaBlock, promise.Local...)
+							s.lock.Unlock()
+							conn.Close()
 						}
 					}
-					for _, transaction := range promise.Local {
-						if transaction.To == s.nodeID {
-							s.myBalance += transaction.Amount
+					wg.Done()
+				}(i, s)
+			}
+
+			fmt.Println("outside Prepare")
+			wg.Wait()
+			fmt.Println("Really outside Prepare")
+			if fail > 3 {
+				break
+			}
+			wg.Add(5)
+			s.lock.Lock()
+			s.megaBlock = append(s.megaBlock, s.transactionLog...)
+			if flag {
+				s.megaBlock = append(s.megaBlock, req)
+				flag = false
+			}
+
+			fmt.Println("MY MEGA BLOCK IS ")
+
+			fmt.Println(s.megaBlock)
+			fail = 0
+			for i := 1; i <= 5; i++ {
+				go func(i int) {
+
+					if i != int(s.nodeID) {
+						fmt.Println("Inside Accept")
+
+						c, ctx, conn := SetupNodeRpcReciever(i)
+						accepted, err := c.Accept(ctx, &pb.AcceptRequest{
+							ProposalNumber: s.currBallotNum,
+							Value:          s.megaBlock,
+						})
+						if err != nil {
+							fail++
+							// log.Fatalf("Could not add: %v", err)
 						}
+						fmt.Println(accepted)
+						conn.Close()
 					}
-					fmt.Println("Printing Promise")
-					fmt.Println(promise)
-					s.megaBlock = append(s.megaBlock, promise.Accept_Val...)
-					s.megaBlock = append(s.megaBlock, promise.Local...)
-					s.lock.Unlock()
-					conn.Close()
-				}
-				wg.Done()
-			}(i, s)
+					defer wg.Done()
+				}(i)
+			}
+			wg.Wait()
+			if fail > 3 {
+				break
+			}
+			// s.lock.Lock()
+			s.myBalance += int32(tempBalance)
+			tempBalance = 0
+			// s.lock.Unlock()
+			wg.Add(5)
+			for i := 1; i <= 5; i++ {
+				go func(i int) {
+
+					if i != int(s.nodeID) {
+						fmt.Println("Inside Commit")
+						c, ctx, conn := SetupNodeRpcReciever(i)
+						ack, err := c.Commit(ctx, &pb.CommitRequest{
+							BallotNumber: &pb.Ballot{
+								BallotNum: s.currBallotNum,
+								NodeID:    s.nodeID,
+							},
+						})
+						if err != nil {
+							log.Fatalf("Could not add: %v", err)
+						}
+
+						fmt.Println(ack)
+						conn.Close()
+					}
+					defer wg.Done()
+				}(i)
+			}
+			wg.Wait()
+			err := s.commitTransactions(true) // Commit transactions to the database
+			if err != nil {
+				return nil, err
+			}
+			s.megaBlock = nil
+			s.transactionLog = nil
+			if s.myBalance-int32(req.Amount) >= 0 {
+				s.myBalance -= req.Amount
+				// s.transactionLog = append(s.transactionLog, req)
+				// fmt.Println("This my transaction log ", s.transactionLog)
+				s.lock.Unlock()
+				break
+			}
+			s.lock.Unlock()
+			// time.Sleep(1 * time.Second)
 		}
-		fmt.Println("outside Prepare")
-		wg.Wait()
-		fmt.Println("Really outside Prepare")
-		wg.Add(5)
+	} else {
 		s.lock.Lock()
-		s.megaBlock = append(s.megaBlock, s.transactionLog...)
-		s.megaBlock = append(s.megaBlock, req)
-
-		fmt.Println("MY MEGA BLOCK IS ")
-
-		fmt.Println(s.megaBlock)
-		for i := 1; i <= 5; i++ {
-			go func(i int) {
-
-				if i != int(s.nodeID) {
-					fmt.Println("Inside Accept")
-
-					c, ctx, conn := SetupNodeRpcReciever(i)
-					accepted, err := c.Accept(ctx, &pb.AcceptRequest{
-						ProposalNumber: s.currBallotNum,
-						Value:          s.megaBlock,
-					})
-					if err != nil {
-						log.Fatalf("Could not add: %v", err)
-					}
-					fmt.Println(accepted)
-					conn.Close()
-				}
-				defer wg.Done()
-			}(i)
+		if s.myBalance-int32(req.Amount) >= 0 {
+			s.myBalance -= req.Amount
+			s.transactionLog = append(s.transactionLog, req)
+			fmt.Println("This my transaction log ", s.transactionLog)
 		}
-		wg.Wait()
-		wg.Add(5)
-		for i := 1; i <= 5; i++ {
-			go func(i int) {
 
-				if i != int(s.nodeID) {
-					fmt.Println("Inside Commit")
-					c, ctx, conn := SetupNodeRpcReciever(i)
-					ack, err := c.Commit(ctx, &pb.CommitRequest{
-						BallotNumber: &pb.Ballot{
-							BallotNum: s.currBallotNum,
-							NodeID:    s.nodeID,
-						},
-					})
-					if err != nil {
-						log.Fatalf("Could not add: %v", err)
-					}
-
-					fmt.Println(ack)
-					conn.Close()
-				}
-				defer wg.Done()
-			}(i)
-		}
-		wg.Wait()
-		err := s.commitTransactions(true) // Commit transactions to the database
-		if err != nil {
-			return nil, err
-		}
 		s.lock.Unlock()
 	}
-	s.lock.Lock()
-	if s.myBalance-int32(req.Amount) >= 0 {
-		s.myBalance -= req.Amount
-		s.transactionLog = append(s.transactionLog, req)
-		// if len(s.megaBlock) != 0 {
-
-		// }
-		fmt.Println("This my transaction log ", s.transactionLog)
-	}
-
-	s.lock.Unlock()
 	return &pb.NodeResponse{Ack: "Node " + strconv.Itoa(int(s.nodeID)) + " Took All transactions"}, nil
 }
 func (s *Node) Kill(ctx context.Context, req *pb.AdminRequest) (*pb.NodeResponse, error) {
@@ -210,7 +247,7 @@ func (s *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Promise
 			Local:        s.transactionLog,
 		}, nil
 	}
-	return &pb.PromiseResponse{}, fmt.Errorf("Prepare request rejected; higher or equal ballot number exists")
+	return &pb.PromiseResponse{BallotNumber: &pb.Ballot{BallotNum: s.currBallotNum}}, fmt.Errorf("Prepare request rejected; higher or equal ballot number exists")
 
 }
 
@@ -246,6 +283,7 @@ func (s *Node) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitedR
 			return nil, err
 		}
 		s.AcceptedMegaBlock = nil
+		s.transactionLog = nil
 		s.isPromised = false
 		return &pb.CommitedResponse{
 			Success: true,
@@ -304,6 +342,7 @@ func (s *Node) commitTransactions(leader bool) error {
 		}
 	} else {
 		for _, transaction := range s.megaBlock {
+			fmt.Println(transaction)
 			_, err := stmt.Exec(transaction.Id, transaction.SetNumber, transaction.From, transaction.To, transaction.Amount)
 			if err != nil {
 				tx.Rollback()
