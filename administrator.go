@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	pb "github.com/abhishekpdeshmukh/PAXOS-BANK-SIMULATOR/proto"
@@ -208,17 +209,37 @@ func main() {
 				}
 
 				// Now send transactions to all servers as usual
+				// for _, tran := range transactions {
+				// 	// Set up RPC connection and send the transaction to all servers (including killed ones)
+				// 	c, ctx, conn := setUPClientRPC(int(tran.From))
+				// 	r, err := c.AcceptTransactions(ctx, tran)
+				// 	if err != nil {
+				// 		log.Fatalf("Could not send transaction: %v", err)
+				// 	}
+				// 	log.Printf("Transaction Sent: %s", r.Ack)
+				// 	conn.Close()
+				// }
+				var wg sync.WaitGroup // Use a wait group to wait for all goroutines to finish
+				wg.Add(len(transactions))
 				for _, tran := range transactions {
-					// Set up RPC connection and send the transaction to all servers (including killed ones)
-					c, ctx, conn := setUPClientRPC(int(tran.From))
-					r, err := c.AcceptTransactions(ctx, tran)
-					if err != nil {
-						log.Fatalf("Could not send transaction: %v", err)
-					}
-					log.Printf("Transaction Sent: %s", r.Ack)
-					conn.Close()
+					// wg.Add(1) // Increment the wait group counter
+					go func(tran *pb.TransactionRequest) {
+						wg.Done()
+						// defer wg.Done() // Decrement the counter when the goroutine completes
+						// Set up RPC connection and send the transaction to all servers (including killed ones)
+						c, ctx, conn := setUPClientRPC(int(tran.From))
+						r, err := c.AcceptTransactions(ctx, tran)
+						if err != nil {
+							log.Printf("Could not send transaction: %v", err)
+							return
+						}
+						log.Printf("Transaction Sent: %s", r.Ack)
+						conn.Close() // Ensure connection is closed in each goroutine
+					}(tran) // Pass the transaction to the anonymous function
 				}
-
+				fmt.Println("Still Waiting")
+				wg.Wait()
+				fmt.Println("Done Waiting")
 				currentSetNumber++ // Move to the next set
 			} else {
 				fmt.Println("No more sets to send.")
