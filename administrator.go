@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -120,6 +121,18 @@ func ReadTransactions(filename string) (map[int][]*pb.TransactionRequest, map[in
 	return transactionSets, liveServersMap, nil
 }
 
+var serverMutexMap = make(map[int]*sync.Mutex)
+var serverMutexMapLock sync.Mutex
+
+func getServerMutex(serverID int) *sync.Mutex {
+	serverMutexMapLock.Lock()
+	defer serverMutexMapLock.Unlock()
+
+	if _, exists := serverMutexMap[serverID]; !exists {
+		serverMutexMap[serverID] = &sync.Mutex{}
+	}
+	return serverMutexMap[serverID]
+}
 func main() {
 	// Initialize variables to track the current set being sent and whether all sets have been read
 	var currentSetNumber = 1
@@ -176,7 +189,10 @@ func main() {
 				}
 
 				// Revive servers that were previously killed but are now alive
+				var wg2 sync.WaitGroup
+				// wg2.Add(len(previouslyKilledServers))
 				for serverID := range previouslyKilledServers {
+					wg2.Add(1)
 					if previouslyKilledServers[serverID] && aliveServerSet[serverID] {
 						fmt.Printf("Reviving Server %d for this set\n", serverID)
 						// // Placeholder for Revive logic, you will implement it later
@@ -190,9 +206,11 @@ func main() {
 						// Mark as no longer killed
 						previouslyKilledServers[serverID] = false
 					}
+					wg2.Done()
 				}
-
+				wg2.Wait()
 				// Kill servers that are not alive for the current set
+				wg2.Add(5)
 				for i := 1; i <= 5; i++ {
 					if _, isAlive := aliveServerSet[i]; !isAlive {
 						fmt.Printf("Killing Server %d for this set\n", i)
@@ -206,39 +224,49 @@ func main() {
 						// Track that this server is now killed
 						previouslyKilledServers[i] = true
 					}
+					wg2.Done()
 				}
+				wg2.Wait()
 
-				// Now send transactions to all servers as usual
-				// for _, tran := range transactions {
-				// 	// Set up RPC connection and send the transaction to all servers (including killed ones)
-				// 	c, ctx, conn := setUPClientRPC(int(tran.From))
-				// 	r, err := c.AcceptTransactions(ctx, tran)
-				// 	if err != nil {
-				// 		log.Fatalf("Could not send transaction: %v", err)
-				// 	}
-				// 	log.Printf("Transaction Sent: %s", r.Ack)
-				// 	conn.Close()
-				// }
-				var wg sync.WaitGroup // Use a wait group to wait for all goroutines to finish
-				wg.Add(len(transactions))
+				// wg.Add(len(transactions))
+				sort.Slice(transactions, func(i, j int) bool {
+					if transactions[i].From == transactions[j].From {
+						// If the transactions are from the same server, sort by Id
+						return transactions[i].Id < transactions[j].Id
+					}
+					// Otherwise, we don't care about the order between different 'From' servers
+					return false
+				})
+				fmt.Println("Current transactions Order")
+				fmt.Println(transactions)
 				for _, tran := range transactions {
-					// wg.Add(1) // Increment the wait group counter
-					go func(tran *pb.TransactionRequest) {
-						wg.Done()
-						// defer wg.Done() // Decrement the counter when the goroutine completes
-						// Set up RPC connection and send the transaction to all servers (including killed ones)
-						c, ctx, conn := setUPClientRPC(int(tran.From))
+					wg2.Add(1)
+					serverID := int(tran.From)
+					serverMutex := getServerMutex(serverID) // Get the mutex for the specific server
+					// fmt.Println("Oiled up Transaction ", tran)
+					go func(tran *pb.TransactionRequest, serverMutex *sync.Mutex) {
+						serverMutex.Lock()
+						defer serverMutex.Unlock() // Unlock when done
+
+						// Set up RPC connection and send the transaction to the appropriate server
+						c, ctx, conn := setUPClientRPC(serverID)
+						defer conn.Close()
+						fmt.Println("Sending Transaction ", tran)
 						r, err := c.AcceptTransactions(ctx, tran)
 						if err != nil {
 							log.Printf("Could not send transaction: %v", err)
 							return
 						}
-						log.Printf("Transaction Sent: %s", r.Ack)
-						conn.Close() // Ensure connection is closed in each goroutine
-					}(tran) // Pass the transaction to the anonymous function
+						log.Printf("Transaction Sent from Server %d: %s", serverID, r.Ack)
+
+					}(tran, serverMutex) // Pass the transaction and serverMutex to the goroutine
+					time.Sleep(2 * time.Millisecond)
+					wg2.Done()
 				}
+				wg2.Wait()
 				fmt.Println("Still Waiting")
-				wg.Wait()
+
+				// time.Sleep(400 * time.Millisecond)
 				fmt.Println("Done Waiting")
 				currentSetNumber++ // Move to the next set
 			} else {
