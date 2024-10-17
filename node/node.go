@@ -36,248 +36,261 @@ type Node struct {
 	lastCommittedIndex    int32
 	db                    *sql.DB
 	lock                  sync.Mutex
+	transactionQueue      chan *pb.TransactionRequest
 }
 
 func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionRequest) (*pb.NodeResponse, error) {
+	fmt.Println("Received transaction request:", req)
+	s.transactionQueue <- req // Push the transaction into the channel
+	return &pb.NodeResponse{Ack: "Transaction added to the queue"}, nil
+}
 
-	fmt.Println("Attempting To accept ", req)
+func processTransaction(s *Node) {
+	for req := range s.transactionQueue {
+		// req := s.transactionQueue[0]
+		// s.transactionQueue = s.transactionQueue[1:]
+		fmt.Println("Attempting To accept ", req)
 
-	if s.myBalance-int32(req.Amount) < 0 && s.isActive {
-		var flag bool = true
-		for {
-			s.currBallotNum += 1
-			fmt.Println("Inside Infinite Loop")
-			fmt.Println("Initiate consensus")
-			var wg sync.WaitGroup
-			wg.Add(5)
-			tempBalance := 0
-			fail := 0
-			var successCount, failCount, respondedCount int // Track successful promises and failures
-			var highestBallotSeen int32 = s.currBallotNum   // Track highest ballot seen
-			var majorityReached bool = false                // Flag for majority reached
-			var mu sync.Mutex                               // Mutex for synchronizing access to shared variables
+		if s.myBalance-int32(req.Amount) < 0 && s.isActive {
+			var flag bool = true
+			for {
+				s.currBallotNum += 1
+				fmt.Println("Inside Infinite Loop")
+				fmt.Println("Initiate consensus")
+				var wg sync.WaitGroup
+				wg.Add(5)
+				tempBalance := 0
+				fail := 0
+				var successCount, failCount, respondedCount int // Track successful promises and failures
+				var highestBallotSeen int32 = s.currBallotNum   // Track highest ballot seen
+				var majorityReached bool = false                // Flag for majority reached
+				var mu sync.Mutex                               // Mutex for synchronizing access to shared variables
 
-			for i := 1; i <= 5; i++ {
-				go func(i int, s *Node) {
-					if i != int(s.nodeID) {
-						fmt.Println("Inside Prepare")
-						c, ctx, conn := SetupNodeRpcReciever(i)
-						defer conn.Close()
+				for i := 1; i <= 5; i++ {
+					go func(i int, s *Node) {
+						if i != int(s.nodeID) {
+							fmt.Println("Inside Prepare")
+							c, ctx, conn := SetupNodeRpcReciever(i)
+							defer conn.Close()
 
-						// Make Prepare request
-						promise, err := c.Prepare(ctx, &pb.PrepareRequest{
-							Ballot: &pb.Ballot{
-								BallotNum: s.currBallotNum,
-								NodeID:    s.nodeID,
-							},
-						})
+							// Make Prepare request
+							promise, err := c.Prepare(ctx, &pb.PrepareRequest{
+								Ballot: &pb.Ballot{
+									BallotNum: s.currBallotNum,
+									NodeID:    s.nodeID,
+								},
+							})
 
-						mu.Lock() // Lock before modifying shared variables
+							mu.Lock() // Lock before modifying shared variables
 
-						if err != nil {
-							if ctx.Err() == context.DeadlineExceeded {
-								// Timeout error, consider node inactive for this round
-								fmt.Println("Prepare request to node", i, "timed out")
-							} else {
-								// Handle other RPC errors (node down, etc.)
-								fmt.Println("Error in Prepare RPC:", err)
-							}
-							failCount++
-						} else if promise.BallotNumber.BallotNum > s.currBallotNum {
-							// Node rejected due to seeing a higher ballot number
-							fmt.Println("Rejected due to higher ballot from node", i, "with ballot", promise.BallotNumber.BallotNum)
-							if promise.BallotNumber.BallotNum > highestBallotSeen {
-								highestBallotSeen = promise.BallotNumber.BallotNum // Track highest ballot
-							}
-							failCount++
-						} else {
-							// Successfully got promise, process it
-							fmt.Println("Promise From ", i)
-							fmt.Println(promise)
-							s.lock.Lock()
-							for _, transaction := range promise.Accept_Val {
-								if transaction.To == s.nodeID {
-									tempBalance += int(transaction.Amount)
+							if err != nil {
+								if ctx.Err() == context.DeadlineExceeded {
+									// Timeout error, consider node inactive for this round
+									fmt.Println("Prepare request to node", i, "timed out")
+								} else {
+									// Handle other RPC errors (node down, etc.)
+									fmt.Println("Error in Prepare RPC:", err)
 								}
-							}
-							for _, transaction := range promise.Local {
-								if transaction.To == s.nodeID {
-									tempBalance += int(transaction.Amount)
+								failCount++
+							} else if promise.BallotNumber.BallotNum > s.currBallotNum {
+								// Node rejected due to seeing a higher ballot number
+								fmt.Println("Rejected due to higher ballot from node", i, "with ballot", promise.BallotNumber.BallotNum)
+								if promise.BallotNumber.BallotNum > highestBallotSeen {
+									highestBallotSeen = promise.BallotNumber.BallotNum // Track highest ballot
 								}
-							}
-							s.megaBlock = append(s.megaBlock, promise.Accept_Val...)
-							s.megaBlock = append(s.megaBlock, promise.Local...)
-							s.lock.Unlock()
-
-							successCount++ // Increment successful promise count
-						}
-
-						respondedCount++ // Increment total responses received (success or fail)
-
-						if successCount >= 3 && !majorityReached {
-							fmt.Println("Majority reached, but waiting for remaining nodes until timeout")
-							majorityReached = true // Mark that we have the majority
-						}
-
-						mu.Unlock() // Unlock after modifying shared variables
-
-					}
-					wg.Done()
-				}(i, s)
-			}
-
-			wg.Wait() // Wait for all responses
-
-			// Check if we have at least a majority of successful promises
-			if successCount >= 2 {
-				fmt.Println("Proceeding to Accept phase in PAXOS")
-				// Continue to Accept phase with the gathered promises
-			} else {
-				fmt.Println("Majority not reached, retrying with higher ballot")
-				s.currBallotNum = highestBallotSeen + 1 // Update ballot number and retry Paxos
-				s.megaBlock = nil
-				time.Sleep(3 * time.Second)
-				continue // Retry with the new ballot number
-			}
-
-			s.lock.Lock()
-
-			// Step 1: Prepare the megaBlock
-			wg.Add(5)
-			s.megaBlock = append(s.megaBlock, s.transactionLog...) // Add existing transaction log
-
-			// Use tempBalance, which has already accumulated the balance from previous transactions
-			if flag && int(s.myBalance)+tempBalance >= int(req.Amount) {
-				s.megaBlock = append(s.megaBlock, req)
-				flag = false
-			}
-
-			fmt.Println("MY MEGA BLOCK IS ", s.megaBlock)
-			fail = 0
-			successCount = 0
-
-			s.lock.Unlock() // Unlock after preparing the megaBlock
-
-			// Step 2: Send Accept Requests
-			for i := 1; i <= 5; i++ {
-				go func(i int) {
-					if i != int(s.nodeID) {
-						fmt.Println("Inside Accept of PAXOS")
-						c, ctx, conn := SetupNodeRpcReciever(i)
-						defer conn.Close()
-
-						accepted, err := c.Accept(ctx, &pb.AcceptRequest{
-							ProposalNumber: s.currBallotNum,
-							Value:          s.megaBlock,
-						})
-						if err != nil {
-							if ctx.Err() == context.DeadlineExceeded {
-								fmt.Println("Accept request to node", i, "timed out")
+								failCount++
 							} else {
-								fmt.Println("Error in Accept RPC:", err)
+								// Successfully got promise, process it
+								fmt.Println("Promise From ", i)
+								fmt.Println(promise)
+								s.lock.Lock()
+								for _, transaction := range promise.Accept_Val {
+									if transaction.To == s.nodeID {
+										tempBalance += int(transaction.Amount)
+									}
+								}
+								for _, transaction := range promise.Local {
+									if transaction.To == s.nodeID {
+										tempBalance += int(transaction.Amount)
+									}
+								}
+								s.megaBlock = append(s.megaBlock, promise.Accept_Val...)
+								s.megaBlock = append(s.megaBlock, promise.Local...)
+								s.lock.Unlock()
+
+								successCount++ // Increment successful promise count
 							}
-							mu.Lock()
-							fail++
-							mu.Unlock()
-						} else {
-							mu.Lock()
-							successCount++
-							mu.Unlock()
-							fmt.Println(accepted)
+
+							respondedCount++ // Increment total responses received (success or fail)
+
+							if successCount >= 3 && !majorityReached {
+								fmt.Println("Majority reached, but waiting for remaining nodes until timeout")
+								majorityReached = true // Mark that we have the majority
+							}
+
+							mu.Unlock() // Unlock after modifying shared variables
+
 						}
-
-					}
-					wg.Done()
-				}(i)
-			}
-
-			// Wait for responses
-			wg.Wait()
-
-			// Step 3: Check if majority (3) has responded positively
-			if successCount >= 2 {
-				fmt.Println("Majority reached, proceed to Commit phase")
-				// s.lock.Lock()
-				// Now update the balance since consensus has been reached
-				s.myBalance += int32(tempBalance) // Use tempBalance to update the node's actual balance
-				tempBalance = 0                   // Reset temporary balance after updating
-				// s.lock.Unlock()
-			} else {
-				fmt.Println("Majority not reached, retrying Paxos")
-				s.megaBlock = nil
-				fmt.Println("Current leader log after failing paxos ", s.transactionLog)
-				time.Sleep(3 * time.Second) // Retry after a delay
-				// You can retry Paxos here, or handle it as per your logic
-
-				continue
-			}
-			s.lock.Lock()
-			wg.Add(5)
-			for i := 1; i <= 5; i++ {
-				go func(i int) {
-
-					if i != int(s.nodeID) {
-						fmt.Println("Inside Commit of PAXOS")
-						c, ctx, conn := SetupNodeRpcReciever(i)
-						ack, err := c.Commit(ctx, &pb.CommitRequest{
-							BallotNumber: &pb.Ballot{
-								BallotNum: s.currBallotNum,
-								NodeID:    s.nodeID,
-							},
-						})
-						if err != nil {
-							// log.Fatalf("Could not add: %v", err)
-
-							// return
-						}
-
-						fmt.Println(ack)
-						conn.Close()
-					}
-					wg.Done()
-				}(i)
-			}
-			wg.Wait()
-			fmt.Println("Hello After wait going to commit now")
-			s.CommittedTransactions = append(s.CommittedTransactions, s.megaBlock...)
-			if len(s.megaBlock) != 0 {
-				err := s.commitTransactions(true) // Commit transactions to the database
-				if err != nil {
-					fmt.Println("Error while commiting")
-					return nil, err
+						wg.Done()
+					}(i, s)
 				}
-			}
-			fmt.Println("Before setting megaBlock and transaction  to nil")
-			s.megaBlock = nil
-			s.transactionLog = nil
-			fmt.Println(s.megaBlock)
-			fmt.Println("After setting megaBlock to nil")
 
+				wg.Wait() // Wait for all responses
+
+				// Check if we have at least a majority of successful promises
+				if successCount >= 2 {
+					fmt.Println("Proceeding to Accept phase in PAXOS")
+					// Continue to Accept phase with the gathered promises
+				} else {
+					fmt.Println("Majority not reached, retrying with higher ballot")
+					s.currBallotNum = highestBallotSeen + 1 // Update ballot number and retry Paxos
+					s.megaBlock = nil
+					time.Sleep(3 * time.Second)
+					continue // Retry with the new ballot number
+				}
+
+				s.lock.Lock()
+
+				// Step 1: Prepare the megaBlock
+				wg.Add(5)
+				s.megaBlock = append(s.megaBlock, s.transactionLog...) // Add existing transaction log
+
+				// Use tempBalance, which has already accumulated the balance from previous transactions
+				if flag && int(s.myBalance)+tempBalance >= int(req.Amount) {
+					s.megaBlock = append(s.megaBlock, req)
+					flag = false
+				}
+
+				fmt.Println("MY MEGA BLOCK IS ", s.megaBlock)
+				fail = 0
+				successCount = 0
+
+				s.lock.Unlock() // Unlock after preparing the megaBlock
+
+				// Step 2: Send Accept Requests
+				for i := 1; i <= 5; i++ {
+					go func(i int) {
+						if i != int(s.nodeID) {
+							fmt.Println("Inside Accept of PAXOS")
+							c, ctx, conn := SetupNodeRpcReciever(i)
+							defer conn.Close()
+
+							accepted, err := c.Accept(ctx, &pb.AcceptRequest{
+								ProposalNumber: s.currBallotNum,
+								Value:          s.megaBlock,
+							})
+							if err != nil {
+								if ctx.Err() == context.DeadlineExceeded {
+									fmt.Println("Accept request to node", i, "timed out")
+								} else {
+									fmt.Println("Error in Accept RPC:", err)
+								}
+								mu.Lock()
+								fail++
+								mu.Unlock()
+							} else {
+								mu.Lock()
+								successCount++
+								mu.Unlock()
+								fmt.Println(accepted)
+							}
+
+						}
+						wg.Done()
+					}(i)
+				}
+
+				// Wait for responses
+				wg.Wait()
+
+				// Step 3: Check if majority (3) has responded positively
+				if successCount >= 2 {
+					fmt.Println("Majority reached, proceed to Commit phase")
+					// s.lock.Lock()
+					// Now update the balance since consensus has been reached
+					s.myBalance += int32(tempBalance) // Use tempBalance to update the node's actual balance
+					tempBalance = 0                   // Reset temporary balance after updating
+					// s.lock.Unlock()
+				} else {
+					fmt.Println("Majority not reached, retrying Paxos")
+					s.megaBlock = nil
+					fmt.Println("Current leader log after failing paxos ", s.transactionLog)
+					time.Sleep(3 * time.Second) // Retry after a delay
+					// You can retry Paxos here, or handle it as per your logic
+
+					continue
+				}
+				s.lock.Lock()
+				wg.Add(5)
+				for i := 1; i <= 5; i++ {
+					go func(i int) {
+
+						if i != int(s.nodeID) {
+							fmt.Println("Inside Commit of PAXOS")
+							c, ctx, conn := SetupNodeRpcReciever(i)
+							ack, err := c.Commit(ctx, &pb.CommitRequest{
+								BallotNumber: &pb.Ballot{
+									BallotNum: s.currBallotNum,
+									NodeID:    s.nodeID,
+								},
+							})
+							if err != nil {
+								// log.Fatalf("Could not add: %v", err)
+
+								// return
+							}
+
+							fmt.Println(ack)
+							conn.Close()
+						}
+						wg.Done()
+					}(i)
+				}
+				wg.Wait()
+				fmt.Println("Hello After wait going to commit now")
+				s.CommittedTransactions = append(s.CommittedTransactions, s.megaBlock...)
+				if len(s.megaBlock) != 0 {
+					err := s.commitTransactions(true) // Commit transactions to the database
+					if err != nil {
+						fmt.Println("Error while commiting")
+						// return nil, err
+					}
+				}
+				fmt.Println("Before setting megaBlock and transaction  to nil")
+				s.megaBlock = nil
+				s.transactionLog = nil
+				fmt.Println(s.megaBlock)
+				fmt.Println("After setting megaBlock to nil")
+
+				if s.myBalance-int32(req.Amount) >= 0 {
+					s.myBalance -= req.Amount
+					// s.transactionLog = append(s.transactionLog, req)
+					fmt.Println("This my transaction log ", s.transactionLog)
+					fmt.Println("Escaping Paxos")
+					s.lock.Unlock()
+					fmt.Println("My megablock is ", s.megaBlock)
+					break
+				}
+				s.lock.Unlock()
+				time.Sleep(3 * time.Second)
+			}
+		} else {
+			s.lock.Lock()
+			fmt.Println("My mega block ", s.megaBlock)
+			fmt.Println("My transactional log before ", s.transactionLog)
 			if s.myBalance-int32(req.Amount) >= 0 {
 				s.myBalance -= req.Amount
-				// s.transactionLog = append(s.transactionLog, req)
+				s.transactionLog = append(s.transactionLog, req)
 				fmt.Println("This my transaction log ", s.transactionLog)
-				fmt.Println("Escaping Paxos")
-				s.lock.Unlock()
-				fmt.Println("My megablock is ", s.megaBlock)
-				break
 			}
-			s.lock.Unlock()
-			time.Sleep(3 * time.Second)
-		}
-	} else {
-		s.lock.Lock()
-		fmt.Println("My mega block ", s.megaBlock)
-		fmt.Println("My transactional log before ", s.transactionLog)
-		if s.myBalance-int32(req.Amount) >= 0 {
-			s.myBalance -= req.Amount
-			s.transactionLog = append(s.transactionLog, req)
-			fmt.Println("This my transaction log ", s.transactionLog)
-		}
 
-		s.lock.Unlock()
+			s.lock.Unlock()
+		}
+		// return &pb.NodeResponse{Ack: "Node " + strconv.Itoa(int(s.nodeID)) + " Took All transactions"}, nil
+
 	}
-	return &pb.NodeResponse{Ack: "Node " + strconv.Itoa(int(s.nodeID)) + " Took All transactions"}, nil
+	// Get the next transaction from the queue
+
 }
 func (s *Node) Kill(ctx context.Context, req *pb.AdminRequest) (*pb.NodeResponse, error) {
 	println(req.Command)
@@ -617,14 +630,16 @@ func main() {
 	id, _ := strconv.Atoi(os.Args[1])
 
 	currNode := &Node{
-		nodeID:         int32(id),
-		isActive:       true,
-		myBalance:      100,
-		currBallotNum:  0,
-		promisedBallot: &pb.Ballot{},
-		lock:           sync.Mutex{},
+		nodeID:           int32(id),
+		isActive:         true,
+		myBalance:        100,
+		currBallotNum:    0,
+		promisedBallot:   &pb.Ballot{},
+		lock:             sync.Mutex{},
+		transactionQueue: make(chan *pb.TransactionRequest, 100), // Buffered channel
 	}
 	currNode.InitDB()
+	go processTransaction(currNode)
 	go SetupRpc(id, currNode)
 	go SetupNodeRpcSender(id, currNode)
 
