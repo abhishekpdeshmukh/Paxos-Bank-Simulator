@@ -22,18 +22,20 @@ var Majority int = 3
 type Node struct {
 	pb.UnimplementedNodeServiceServer
 	pb.UnimplementedPaxosServiceServer
-	nodeID             int32
-	isActive           bool
-	myBalance          int32
-	currBallotNum      int32
-	isPromised         bool
-	promisedBallot     *pb.Ballot
-	transactionLog     []*pb.TransactionRequest
-	megaBlock          []*pb.TransactionRequest
-	AcceptedMegaBlock  []*pb.TransactionRequest
-	highestTransIDSent int32
-	db                 *sql.DB
-	lock               sync.Mutex
+	nodeID                int32
+	isActive              bool
+	myBalance             int32
+	currBallotNum         int32
+	isPromised            bool
+	promisedBallot        *pb.Ballot
+	transactionLog        []*pb.TransactionRequest
+	megaBlock             []*pb.TransactionRequest
+	AcceptedMegaBlock     []*pb.TransactionRequest
+	CommittedTransactions []*pb.TransactionRequest
+	highestTransIDSent    int32
+	lastCommittedIndex    int32
+	db                    *sql.DB
+	lock                  sync.Mutex
 }
 
 func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionRequest) (*pb.NodeResponse, error) {
@@ -237,10 +239,13 @@ func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionReques
 			}
 			wg.Wait()
 			fmt.Println("Hello After wait going to commit now")
-			err := s.commitTransactions(true) // Commit transactions to the database
-			if err != nil {
-				fmt.Println("Error while commiting")
-				return nil, err
+			s.CommittedTransactions = append(s.CommittedTransactions, s.megaBlock...)
+			if len(s.megaBlock) != 0 {
+				err := s.commitTransactions(true) // Commit transactions to the database
+				if err != nil {
+					fmt.Println("Error while commiting")
+					return nil, err
+				}
 			}
 			fmt.Println("Before setting megaBlock and transaction  to nil")
 			s.megaBlock = nil
@@ -286,13 +291,91 @@ func (s *Node) Kill(ctx context.Context, req *pb.AdminRequest) (*pb.NodeResponse
 
 func (s *Node) Revive(ctx context.Context, req *pb.ReviveRequest) (*pb.ReviveResponse, error) {
 	s.lock.Lock()
-	defer s.lock.Unlock()
 	s.isActive = true
+	lastCommittedIndex := s.lastCommittedIndex // Use the highest transaction ID committed
+	s.lock.Unlock()
+	fmt.Println("Last Commited Index of ", s.nodeID, " is ", lastCommittedIndex)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	highestBlockLength := 0
+	var highestBlock []*pb.TransactionRequest
+
+	// Send RPC to all other nodes to request their commit blocks
+	for i := 1; i <= 5; i++ { // Assuming 5 nodes in the system
+		if i == int(s.nodeID) {
+			continue
+		}
+
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			c, ctx, conn := SetupNodeRpcReciever(i)
+			defer conn.Close()
+
+			// Send the last committed index with the request
+			response, err := c.RequestCommitBlock(ctx, &pb.CommitBlockRequest{
+				NodeId:             s.nodeID,
+				LastCommittedIndex: lastCommittedIndex,
+			})
+			if err != nil {
+				fmt.Printf("Failed to get commit block from node %d: %v\n", i, err)
+				return
+			}
+
+			mu.Lock()
+			if response.CommitBlockLength > int32(highestBlockLength) {
+				highestBlockLength = int(response.CommitBlockLength)
+				highestBlock = response.CommittedTransactions
+			}
+			mu.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Println("Sending Highest Block ", highestBlock)
+	// Now commit the highest block to the revived node
+	s.lock.Lock()
+	s.commitTransactionsFromBlock(highestBlock)
+	s.lock.Unlock()
+
 	return &pb.ReviveResponse{
 		Success: true,
 	}, nil
 }
-
+func (s *Node) commitTransactionsFromBlock(block []*pb.TransactionRequest) error {
+	// Apply only the transactions that come after the last committed index
+	var temp []*pb.TransactionRequest
+	for _, transaction := range block {
+		if transaction.Id > s.lastCommittedIndex {
+			// Apply the transaction logic (update balance, etc.)
+			if transaction.To == s.nodeID {
+				s.myBalance += transaction.Amount
+			}
+			temp = append(temp, transaction)
+			// Update the highest transaction ID committed
+			// s.lastCommittedIndex = transaction.Id
+		}
+	}
+	// fmt.Println("Filter Block is")
+	// fmt.Println(temp)
+	if len(temp) == 0 {
+		return nil
+	}
+	s.AcceptedMegaBlock = temp
+	s.commitTransactions(false) // Commit to the database
+	s.AcceptedMegaBlock = nil
+	return nil
+}
+func (s *Node) RequestCommitBlock(ctx context.Context, req *pb.CommitBlockRequest) (*pb.CommitBlockResponse, error) {
+	fmt.Println("Got A request from ", req.NodeId)
+	fmt.Println("Sending ", s.CommittedTransactions)
+	return &pb.CommitBlockResponse{
+		CommitBlockLength:     int32(len(s.CommittedTransactions)),
+		CommittedTransactions: s.CommittedTransactions,
+	}, nil
+}
 func (s *Node) GetBalance(ctx context.Context, req *pb.AdminRequest) (*pb.BalanceResponse, error) {
 	println(req.Command)
 	// s.lock.Lock()
@@ -434,6 +517,12 @@ func (s *Node) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitedR
 		// s.transactionLog = nil
 		// Commit transactions to the database
 		fmt.Println("Transactional Log after in Commit ", s.transactionLog)
+		s.CommittedTransactions = append(s.CommittedTransactions, s.AcceptedMegaBlock...)
+		if len(s.AcceptedMegaBlock) == 0 {
+			return &pb.CommitedResponse{
+				Success: true,
+			}, nil
+		}
 		err := s.commitTransactions(false)
 		if err != nil {
 			return nil, err
@@ -496,14 +585,20 @@ func (s *Node) commitTransactions(leader bool) error {
 	defer stmt.Close()
 
 	if !leader {
+
+		s.lastCommittedIndex = s.AcceptedMegaBlock[len(s.AcceptedMegaBlock)-1].Id
+		fmt.Println("Last commited index id ", s.lastCommittedIndex)
 		for _, transaction := range s.AcceptedMegaBlock {
 			_, err := stmt.Exec(transaction.Id, transaction.SetNumber, transaction.From, transaction.To, transaction.Amount)
 			if err != nil {
 				tx.Rollback()
 				return err
 			}
+			fmt.Println(transaction)
 		}
 	} else {
+		fmt.Println("Printing Mega Block commit for leader ", s.megaBlock)
+		s.lastCommittedIndex = s.megaBlock[len(s.megaBlock)-1].Id
 		for _, transaction := range s.megaBlock {
 			fmt.Println(transaction)
 			_, err := stmt.Exec(transaction.Id, transaction.SetNumber, transaction.From, transaction.To, transaction.Amount)
