@@ -37,26 +37,35 @@ type Node struct {
 	db                    *sql.DB
 	lock                  sync.Mutex
 	transactionQueue      chan *pb.TransactionRequest
+	latencyMap            map[int32]LatencyRecord
+	paxosLatencies        map[int32]time.Time
+	nonPaxosLatencies     map[int32]time.Time
+}
+
+type LatencyRecord struct {
+	Transaction *pb.TransactionRequest
+	Latency     time.Duration
 }
 
 func (s *Node) AcceptTransactions(ctx context.Context, req *pb.TransactionRequest) (*pb.NodeResponse, error) {
-	fmt.Println("Received transaction request:", req)
+	// //fmt.Println("Received transaction request:", req)
 	s.transactionQueue <- req // Push the transaction into the channel
 	return &pb.NodeResponse{Ack: "Transaction added to the queue"}, nil
 }
 
 func processTransaction(s *Node) {
 	for req := range s.transactionQueue {
-		// req := s.transactionQueue[0]
-		// s.transactionQueue = s.transactionQueue[1:]
-		fmt.Println("Attempting To accept ", req)
+
+		// //fmt.Println("Attempting To accept ", req)
 
 		if s.myBalance-int32(req.Amount) < 0 && s.isActive {
+			s.paxosLatencies[req.Id] = time.Now()
+			startTime := s.paxosLatencies[req.Id]
 			var flag bool = true
 			for {
 				s.currBallotNum += 1
-				fmt.Println("Inside Infinite Loop")
-				fmt.Println("Initiate consensus")
+				// //fmt.Println("Inside Infinite Loop")
+				// //fmt.Println("Initiate consensus")
 				var wg sync.WaitGroup
 				wg.Add(5)
 				tempBalance := 0
@@ -69,7 +78,7 @@ func processTransaction(s *Node) {
 				for i := 1; i <= 5; i++ {
 					go func(i int, s *Node) {
 						if i != int(s.nodeID) {
-							fmt.Println("Inside Prepare")
+							// //fmt.Println("Inside Prepare")
 							c, ctx, conn := SetupNodeRpcReciever(i)
 							defer conn.Close()
 
@@ -86,23 +95,23 @@ func processTransaction(s *Node) {
 							if err != nil {
 								if ctx.Err() == context.DeadlineExceeded {
 									// Timeout error, consider node inactive for this round
-									fmt.Println("Prepare request to node", i, "timed out")
+									//fmt.Println("Prepare request to node", i, "timed out")
 								} else {
 									// Handle other RPC errors (node down, etc.)
-									fmt.Println("Error in Prepare RPC:", err)
+									//fmt.Println("Error in Prepare RPC:", err)
 								}
 								failCount++
 							} else if promise.BallotNumber.BallotNum > s.currBallotNum {
 								// Node rejected due to seeing a higher ballot number
-								fmt.Println("Rejected due to higher ballot from node", i, "with ballot", promise.BallotNumber.BallotNum)
+								//fmt.Println("Rejected due to higher ballot from node", i, "with ballot", promise.BallotNumber.BallotNum)
 								if promise.BallotNumber.BallotNum > highestBallotSeen {
 									highestBallotSeen = promise.BallotNumber.BallotNum // Track highest ballot
 								}
 								failCount++
 							} else {
 								// Successfully got promise, process it
-								fmt.Println("Promise From ", i)
-								fmt.Println(promise)
+								// //fmt.Println("Promise From ", i)
+								// //fmt.Println(promise)
 								s.lock.Lock()
 								for _, transaction := range promise.Accept_Val {
 									if transaction.To == s.nodeID {
@@ -124,7 +133,7 @@ func processTransaction(s *Node) {
 							respondedCount++ // Increment total responses received (success or fail)
 
 							if successCount >= 3 && !majorityReached {
-								fmt.Println("Majority reached, but waiting for remaining nodes until timeout")
+								// //fmt.Println("Majority reached, but waiting for remaining nodes until timeout")
 								majorityReached = true // Mark that we have the majority
 							}
 
@@ -139,10 +148,10 @@ func processTransaction(s *Node) {
 
 				// Check if we have at least a majority of successful promises
 				if successCount >= 2 {
-					fmt.Println("Proceeding to Accept phase in PAXOS")
+					// //fmt.Println("Proceeding to Accept phase in PAXOS")
 					// Continue to Accept phase with the gathered promises
 				} else {
-					fmt.Println("Majority not reached, retrying with higher ballot")
+					// //fmt.Println("Majority not reached, retrying with higher ballot")
 					s.currBallotNum = highestBallotSeen + 1 // Update ballot number and retry Paxos
 					s.megaBlock = nil
 					time.Sleep(3 * time.Second)
@@ -161,7 +170,7 @@ func processTransaction(s *Node) {
 					flag = false
 				}
 
-				fmt.Println("MY MEGA BLOCK IS ", s.megaBlock)
+				// //fmt.Println("MY MEGA BLOCK IS ", s.megaBlock)
 				fail = 0
 				successCount = 0
 
@@ -171,19 +180,19 @@ func processTransaction(s *Node) {
 				for i := 1; i <= 5; i++ {
 					go func(i int) {
 						if i != int(s.nodeID) {
-							fmt.Println("Inside Accept of PAXOS")
+							// //fmt.Println("Inside Accept of PAXOS")
 							c, ctx, conn := SetupNodeRpcReciever(i)
 							defer conn.Close()
 
-							accepted, err := c.Accept(ctx, &pb.AcceptRequest{
+							_, err := c.Accept(ctx, &pb.AcceptRequest{
 								ProposalNumber: s.currBallotNum,
 								Value:          s.megaBlock,
 							})
 							if err != nil {
 								if ctx.Err() == context.DeadlineExceeded {
-									fmt.Println("Accept request to node", i, "timed out")
+									//fmt.Println("Accept request to node", i, "timed out")
 								} else {
-									fmt.Println("Error in Accept RPC:", err)
+									//fmt.Println("Error in Accept RPC:", err)
 								}
 								mu.Lock()
 								fail++
@@ -192,7 +201,7 @@ func processTransaction(s *Node) {
 								mu.Lock()
 								successCount++
 								mu.Unlock()
-								fmt.Println(accepted)
+								//fmt.Println(accepted)
 							}
 
 						}
@@ -205,16 +214,23 @@ func processTransaction(s *Node) {
 
 				// Step 3: Check if majority (3) has responded positively
 				if successCount >= 2 {
-					fmt.Println("Majority reached, proceed to Commit phase")
-					// s.lock.Lock()
+					// //fmt.Println("Majority reached, proceed to Commit phase")
+					s.lock.Lock()
 					// Now update the balance since consensus has been reached
 					s.myBalance += int32(tempBalance) // Use tempBalance to update the node's actual balance
 					tempBalance = 0                   // Reset temporary balance after updating
 					// s.lock.Unlock()
+					latency := time.Since(startTime)
+					s.latencyMap[req.Id] = LatencyRecord{
+						Transaction: req,
+						Latency:     latency,
+					}
+					delete(s.paxosLatencies, req.Id)
+					s.lock.Unlock()
 				} else {
-					fmt.Println("Majority not reached, retrying Paxos")
+					// //fmt.Println("Majority not reached, retrying Paxos")
 					s.megaBlock = nil
-					fmt.Println("Current leader log after failing paxos ", s.transactionLog)
+					// //fmt.Println("Current leader log after failing paxos ", s.transactionLog)
 					time.Sleep(3 * time.Second) // Retry after a delay
 					// You can retry Paxos here, or handle it as per your logic
 
@@ -226,9 +242,9 @@ func processTransaction(s *Node) {
 					go func(i int) {
 
 						if i != int(s.nodeID) {
-							fmt.Println("Inside Commit of PAXOS")
+							// //fmt.Println("Inside Commit of PAXOS")
 							c, ctx, conn := SetupNodeRpcReciever(i)
-							ack, err := c.Commit(ctx, &pb.CommitRequest{
+							_, err := c.Commit(ctx, &pb.CommitRequest{
 								BallotNumber: &pb.Ballot{
 									BallotNum: s.currBallotNum,
 									NodeID:    s.nodeID,
@@ -240,35 +256,35 @@ func processTransaction(s *Node) {
 								// return
 							}
 
-							fmt.Println(ack)
+							//fmt.Println(ack)
 							conn.Close()
 						}
 						wg.Done()
 					}(i)
 				}
 				wg.Wait()
-				fmt.Println("Hello After wait going to commit now")
+				// //fmt.Println("Hello After wait going to commit now")
 				s.CommittedTransactions = append(s.CommittedTransactions, s.megaBlock...)
 				if len(s.megaBlock) != 0 {
 					err := s.commitTransactions(true) // Commit transactions to the database
 					if err != nil {
-						fmt.Println("Error while commiting")
+						// //fmt.Println("Error while commiting")
 						// return nil, err
 					}
 				}
-				fmt.Println("Before setting megaBlock and transaction  to nil")
+				// //fmt.Println("Before setting megaBlock and transaction  to nil")
 				s.megaBlock = nil
 				s.transactionLog = nil
-				fmt.Println(s.megaBlock)
-				fmt.Println("After setting megaBlock to nil")
+				// //fmt.Println(s.megaBlock)
+				// //fmt.Println("After setting megaBlock to nil")
 
 				if s.myBalance-int32(req.Amount) >= 0 {
 					s.myBalance -= req.Amount
 					// s.transactionLog = append(s.transactionLog, req)
-					fmt.Println("This my transaction log ", s.transactionLog)
-					fmt.Println("Escaping Paxos")
+					// //fmt.Println("This my transaction log ", s.transactionLog)
+					// //fmt.Println("Escaping Paxos")
 					s.lock.Unlock()
-					fmt.Println("My megablock is ", s.megaBlock)
+					// //fmt.Println("My megablock is ", s.megaBlock)
 					break
 				}
 				s.lock.Unlock()
@@ -276,12 +292,20 @@ func processTransaction(s *Node) {
 			}
 		} else {
 			s.lock.Lock()
-			fmt.Println("My mega block ", s.megaBlock)
-			fmt.Println("My transactional log before ", s.transactionLog)
+			s.nonPaxosLatencies[req.Id] = time.Now()
+			startTime := s.nonPaxosLatencies[req.Id]
+			// //fmt.Println("My mega block ", s.megaBlock)
+			// //fmt.Println("My transactional log before ", s.transactionLog)
 			if s.myBalance-int32(req.Amount) >= 0 {
 				s.myBalance -= req.Amount
 				s.transactionLog = append(s.transactionLog, req)
-				fmt.Println("This my transaction log ", s.transactionLog)
+				latency := time.Since(startTime)
+				s.latencyMap[req.Id] = LatencyRecord{
+					Transaction: req,
+					Latency:     latency,
+				}
+				delete(s.nonPaxosLatencies, req.Id)
+				//fmt.Println("This my transaction log ", s.transactionLog)
 			}
 
 			s.lock.Unlock()
@@ -289,7 +313,6 @@ func processTransaction(s *Node) {
 		// return &pb.NodeResponse{Ack: "Node " + strconv.Itoa(int(s.nodeID)) + " Took All transactions"}, nil
 
 	}
-	// Get the next transaction from the queue
 
 }
 func (s *Node) Kill(ctx context.Context, req *pb.AdminRequest) (*pb.NodeResponse, error) {
@@ -302,12 +325,33 @@ func (s *Node) Kill(ctx context.Context, req *pb.AdminRequest) (*pb.NodeResponse
 	}
 }
 
+func (s *Node) GetLatencies(ctx context.Context, req *pb.EmptyRequest) (*pb.LatencyResponse, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	latencyRecords := []*pb.LatencyRecord{}
+
+	for id, record := range s.latencyMap {
+		latencyRecords = append(latencyRecords, &pb.LatencyRecord{
+			Id:      id,
+			From:    record.Transaction.From,
+			To:      record.Transaction.To,
+			Amount:  record.Transaction.Amount,
+			Latency: record.Latency.String(),
+		})
+	}
+
+	return &pb.LatencyResponse{
+		Latencies: latencyRecords,
+	}, nil
+}
+
 func (s *Node) Revive(ctx context.Context, req *pb.ReviveRequest) (*pb.ReviveResponse, error) {
 	s.lock.Lock()
 	s.isActive = true
 	lastCommittedIndex := s.lastCommittedIndex // Use the highest transaction ID committed
 	s.lock.Unlock()
-	fmt.Println("Last Commited Index of ", s.nodeID, " is ", lastCommittedIndex)
+	////fmt.Println("Last Commited Index of ", s.nodeID, " is ", lastCommittedIndex)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -347,7 +391,7 @@ func (s *Node) Revive(ctx context.Context, req *pb.ReviveRequest) (*pb.ReviveRes
 	}
 
 	wg.Wait()
-	fmt.Println("Sending Highest Block ", highestBlock)
+	////fmt.Println("Sending Highest Block ", highestBlock)
 	// Now commit the highest block to the revived node
 	s.lock.Lock()
 	s.commitTransactionsFromBlock(highestBlock)
@@ -371,8 +415,8 @@ func (s *Node) commitTransactionsFromBlock(block []*pb.TransactionRequest) error
 			// s.lastCommittedIndex = transaction.Id
 		}
 	}
-	// fmt.Println("Filter Block is")
-	// fmt.Println(temp)
+	// ////fmt.Println("Filter Block is")
+	// ////fmt.Println(temp)
 	if len(temp) == 0 {
 		return nil
 	}
@@ -382,22 +426,15 @@ func (s *Node) commitTransactionsFromBlock(block []*pb.TransactionRequest) error
 	return nil
 }
 func (s *Node) RequestCommitBlock(ctx context.Context, req *pb.CommitBlockRequest) (*pb.CommitBlockResponse, error) {
-	fmt.Println("Got A request from ", req.NodeId)
-	fmt.Println("Sending ", s.CommittedTransactions)
+	//fmt.Println("Got A request from ", req.NodeId)
+	//fmt.Println("Sending ", s.CommittedTransactions)
 	return &pb.CommitBlockResponse{
 		CommitBlockLength:     int32(len(s.CommittedTransactions)),
 		CommittedTransactions: s.CommittedTransactions,
 	}, nil
 }
 func (s *Node) GetBalance(ctx context.Context, req *pb.AdminRequest) (*pb.BalanceResponse, error) {
-	println(req.Command)
-	// s.lock.Lock()
-	// defer s.lock.Unlock()
-	// if s.isActive {
 
-	// } else {
-	// 	return
-	// }
 	return &pb.BalanceResponse{Balance: int32(s.myBalance), NodeID: int32(s.nodeID)}, nil
 }
 
@@ -411,9 +448,9 @@ func (s *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Promise
 	defer s.lock.Unlock()
 
 	// Log current state for debugging purposes
-	fmt.Println("Inside Folower Prepare")
-	fmt.Println("AcceptedTransactions: ", s.AcceptedMegaBlock)
-	fmt.Println("TransactionLog: ", s.transactionLog)
+	//fmt.Println("Inside Folower Prepare")
+	//fmt.Println("AcceptedTransactions: ", s.AcceptedMegaBlock)
+	//fmt.Println("TransactionLog: ", s.transactionLog)
 
 	// Check if the request's ballot number is valid to promise
 	if compareBallot(s, req) {
@@ -429,7 +466,7 @@ func (s *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Promise
 				}
 			}
 			s.highestTransIDSent = highestLocalTransID
-			fmt.Println("The highest ID sent is ", highestLocalTransID)
+			//fmt.Println("The highest ID sent is ", highestLocalTransID)
 			// If already promised, return previously accepted ballot and values
 			return &pb.PromiseResponse{
 				BallotNumber: req.Ballot,
@@ -446,7 +483,7 @@ func (s *Node) Prepare(ctx context.Context, req *pb.PrepareRequest) (*pb.Promise
 				}
 			}
 			s.highestTransIDSent = highestLocalTransID
-			fmt.Println("The highest ID sent is ", highestLocalTransID)
+			//fmt.Println("The highest ID sent is ", highestLocalTransID)
 			s.isPromised = true
 			return &pb.PromiseResponse{
 				BallotNumber: req.Ballot, // Promise on the received ballot number
@@ -469,8 +506,8 @@ func (s *Node) Accept(ctx context.Context, req *pb.AcceptRequest) (*pb.AcceptedR
 
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	fmt.Println("Inside Accept of follower")
-	fmt.Println("TransactionLog: ", s.transactionLog)
+	//fmt.Println("Inside Accept of follower")
+	//fmt.Println("TransactionLog: ", s.transactionLog)
 
 	// Only accept if the proposal number is greater than or equal to current ballot number
 	if req.ProposalNumber == s.currBallotNum {
@@ -479,7 +516,7 @@ func (s *Node) Accept(ctx context.Context, req *pb.AcceptRequest) (*pb.AcceptedR
 		s.currBallotNum = req.ProposalNumber
 
 		// Return a successful response
-		fmt.Println("Accepted Mega Block: ", s.AcceptedMegaBlock)
+		//fmt.Println("Accepted Mega Block: ", s.AcceptedMegaBlock)
 		return &pb.AcceptedResponse{
 			ProposalNumber: req.ProposalNumber,
 			Success:        true, // Indicate that the proposal was accepted
@@ -487,7 +524,7 @@ func (s *Node) Accept(ctx context.Context, req *pb.AcceptRequest) (*pb.AcceptedR
 	}
 
 	// If the proposal number is less, reject the proposal
-	fmt.Println("Rejected proposal with ProposalNumber: ", req.ProposalNumber)
+	//fmt.Println("Rejected proposal with ProposalNumber: ", req.ProposalNumber)
 	return &pb.AcceptedResponse{
 		ProposalNumber: req.ProposalNumber,
 		Success:        false, // Indicate that the proposal was rejected
@@ -502,7 +539,7 @@ func (s *Node) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitedR
 
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	fmt.Println("Inside Commit of follower")
+	//fmt.Println("Inside Commit of follower")
 
 	// Sort transactions by ID before committing
 	s.sortTransactions()
@@ -518,18 +555,18 @@ func (s *Node) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitedR
 
 		// Remove transactions from transactionLog that have been committed
 		var newTransactionLog []*pb.TransactionRequest
-		fmt.Println("Higest Transaction ID sent ", s.highestTransIDSent)
+		//fmt.Println("Higest Transaction ID sent ", s.highestTransIDSent)
 		for _, transaction := range s.transactionLog {
 			// Keep transactions that have IDs higher than highestTransIDSent
 			if transaction.Id > s.highestTransIDSent {
 				newTransactionLog = append(newTransactionLog, transaction)
 			}
 		}
-		fmt.Println("Transactional Log before in Commit ", s.transactionLog)
+		//fmt.Println("Transactional Log before in Commit ", s.transactionLog)
 		s.transactionLog = newTransactionLog // Update the transactionLog with remaining transactions
 		// s.transactionLog = nil
 		// Commit transactions to the database
-		fmt.Println("Transactional Log after in Commit ", s.transactionLog)
+		//fmt.Println("Transactional Log after in Commit ", s.transactionLog)
 		s.CommittedTransactions = append(s.CommittedTransactions, s.AcceptedMegaBlock...)
 		if len(s.AcceptedMegaBlock) == 0 {
 			return &pb.CommitedResponse{
@@ -562,7 +599,7 @@ func (s *Node) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitedR
 func (s *Node) InitDB() {
 	db, err := sql.Open("sqlite3", fmt.Sprintf("node_%d.db", s.nodeID))
 	if err != nil {
-		fmt.Println("Error opening database:", err)
+		//fmt.Println("Error opening database:", err)
 		return
 	}
 	s.db = db
@@ -575,7 +612,7 @@ func (s *Node) InitDB() {
         amount INTEGER
     )`)
 	if err != nil {
-		fmt.Println("Error creating table:", err)
+		//fmt.Println("Error creating table:", err)
 	}
 }
 
@@ -600,26 +637,26 @@ func (s *Node) commitTransactions(leader bool) error {
 	if !leader {
 
 		s.lastCommittedIndex = s.AcceptedMegaBlock[len(s.AcceptedMegaBlock)-1].Id
-		fmt.Println("Last commited index id ", s.lastCommittedIndex)
+		//fmt.Println("Last commited index id ", s.lastCommittedIndex)
 		for _, transaction := range s.AcceptedMegaBlock {
 			_, err := stmt.Exec(transaction.Id, transaction.SetNumber, transaction.From, transaction.To, transaction.Amount)
 			if err != nil {
 				tx.Rollback()
 				return err
 			}
-			fmt.Println(transaction)
+			//fmt.Println(transaction)
 		}
 	} else {
-		fmt.Println("Printing Mega Block commit for leader ", s.megaBlock)
+		//fmt.Println("Printing Mega Block commit for leader ", s.megaBlock)
 		s.lastCommittedIndex = s.megaBlock[len(s.megaBlock)-1].Id
 		for _, transaction := range s.megaBlock {
-			fmt.Println(transaction)
+			//fmt.Println(transaction)
 			_, err := stmt.Exec(transaction.Id, transaction.SetNumber, transaction.From, transaction.To, transaction.Amount)
 			if err != nil {
 				tx.Rollback()
 				return err
 			}
-			fmt.Println(transaction)
+			//fmt.Println(transaction)
 		}
 	}
 
@@ -630,13 +667,16 @@ func main() {
 	id, _ := strconv.Atoi(os.Args[1])
 
 	currNode := &Node{
-		nodeID:           int32(id),
-		isActive:         true,
-		myBalance:        100,
-		currBallotNum:    0,
-		promisedBallot:   &pb.Ballot{},
-		lock:             sync.Mutex{},
-		transactionQueue: make(chan *pb.TransactionRequest, 100), // Buffered channel
+		nodeID:            int32(id),
+		isActive:          true,
+		myBalance:         100,
+		currBallotNum:     0,
+		promisedBallot:    &pb.Ballot{},
+		lock:              sync.Mutex{},
+		transactionQueue:  make(chan *pb.TransactionRequest, 100), // Buffered channel
+		paxosLatencies:    make(map[int32]time.Time),              // Initialize the paxosLatencies map
+		nonPaxosLatencies: make(map[int32]time.Time),              // Initialize the nonPaxosLatencies map
+		latencyMap:        make(map[int32]LatencyRecord),
 	}
 	currNode.InitDB()
 	go processTransaction(currNode)
@@ -663,7 +703,7 @@ func SetupNodeRpcSender(id int, node *Node) {
 }
 
 func SetupNodeRpcReciever(id int) (pb.PaxosServiceClient, context.Context, *grpc.ClientConn) {
-	// fmt.Println("Setting Up RPC Reciever")
+	// //fmt.Println("Setting Up RPC Reciever")
 	conn, err := grpc.Dial("localhost:"+strconv.Itoa((5005+id+5)), grpc.WithInsecure(), grpc.WithBlock())
 	if err != nil {
 		log.Fatalf("Could not connect: %v", err)
@@ -696,4 +736,11 @@ func compareBallot(s *Node, req *pb.PrepareRequest) bool {
 		return true
 	}
 	return false
+}
+
+func (s *Node) PrintLogs(ctx context.Context, req *pb.PrintLogRequest) (*pb.PrintLogResponse, error) {
+	return &pb.PrintLogResponse{
+		Logs:         s.transactionLog,
+		CommitedLogs: s.CommittedTransactions,
+	}, nil
 }
