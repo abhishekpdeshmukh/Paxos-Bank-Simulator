@@ -9,14 +9,32 @@ service NodeService {
     rpc AcceptTransactions(TransactionRequest) returns(NodeResponse){}
     rpc GetBalance(AdminRequest)returns (BalanceResponse){}
     rpc Revive(ReviveRequest)returns(ReviveResponse){}
+    rpc PrintLogs(PrintLogRequest)returns(PrintLogResponse){}
+    rpc GetLatencies(EmptyRequest) returns (LatencyResponse);
 }
 
 service PaxosService {
     rpc Prepare(PrepareRequest) returns (PromiseResponse){}
     rpc Accept(AcceptRequest) returns (AcceptedResponse){}
     rpc Commit(CommitRequest) returns (CommitedResponse){}
+    rpc RequestCommitBlock (CommitBlockRequest) returns (CommitBlockResponse){};
 }
 
+
+message LatencyResponse {
+    repeated LatencyRecord latencies = 1;
+}
+
+message LatencyRecord {
+    int32 id = 1;
+    int32 from = 2;
+    int32 to = 3;
+    int32 amount = 4;
+    string latency = 5; // The latency formatted as a string
+}
+message EmptyRequest {
+
+}
 message ReviveRequest{
     int32 nodeID = 1;
 }
@@ -47,12 +65,28 @@ message PromiseResponse {
 
 
 message AcceptedResponse {
-    int32 proposalNumber = 1;  // The ballot number n of the accepted proposal
+    int32 proposalNumber = 1;  // The ballot number n for the proposal
+    bool success = 2;          // Indicates whether the proposal was accepted
 }
 
 
+message CommitBlockRequest {
+    int32 node_id = 1;           // The node requesting the state
+    int32 last_committed_index = 2; // The last committed index of the requesting node
+}
 
+message CommitBlockResponse {
+    int32 commit_block_length = 1;  // Length of the committed block
+    repeated TransactionRequest committed_transactions = 2; // The committed transactions
+}
 
+message PrintLogRequest {
+
+}
+message PrintLogResponse {
+    repeated TransactionRequest logs = 1;
+    repeated TransactionRequest commitedLogs = 2;
+}
 
 message AdminRequest {
     string command = 1;
