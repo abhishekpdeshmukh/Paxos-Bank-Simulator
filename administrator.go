@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -14,16 +15,23 @@ import (
 	"time"
 
 	pb "github.com/abhishekpdeshmukh/PAXOS-BANK-SIMULATOR/proto"
+	_ "github.com/mattn/go-sqlite3"
 	"google.golang.org/grpc"
 )
 
-// Global variables to store transactions grouped by set number and alive servers for each set
+type Transaction struct {
+	ID          int
+	SetNumber   int
+	FromAccount int
+	ToAccount   int
+	Amount      int
+}
+
 var transactionSets = make(map[int][]*pb.TransactionRequest)
 var liveServersMap = make(map[int][]int)
 var previouslyKilledServers = make(map[int]bool) // Track previously killed servers
 var golbalTransactionID = 1
 
-// Function to set up client RPC connection
 func setUPClientRPC(id int) (pb.NodeServiceClient, context.Context, *grpc.ClientConn) {
 	conn, err := grpc.Dial("localhost:5005"+strconv.Itoa(id), grpc.WithInsecure(), grpc.WithBlock())
 	if err != nil {
@@ -55,7 +63,7 @@ func ReadTransactions(filename string) (map[int][]*pb.TransactionRequest, map[in
 		if err != nil {
 			return nil, nil, err
 		}
-		// If the first column contains the set number, we are starting a new set
+		// If the first column contains the set number, starting a new set
 		if record[0] != "" {
 			// Parse the new set number
 			setNumber, err := strconv.Atoi(record[0])
@@ -79,7 +87,7 @@ func ReadTransactions(filename string) (map[int][]*pb.TransactionRequest, map[in
 			}
 			// Store the live servers for this set
 			liveServersMap[currentSetNumber] = currentAliveServers
-			// continue // Go to the next line for transactions
+
 		}
 
 		// If no set number is provided, we are still in the current set
@@ -133,23 +141,60 @@ func getServerMutex(serverID int) *sync.Mutex {
 	}
 	return serverMutexMap[serverID]
 }
+func ReadDBTransactions(nodeID int) error {
+
+	db, err := sql.Open("sqlite3", fmt.Sprintf("node/node_%d.db", nodeID))
+	if err != nil {
+		return fmt.Errorf("error opening database: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT id, set_number, from_account, to_account, amount FROM transactions")
+	if err != nil {
+		return fmt.Errorf("error querying transactions: %v", err)
+	}
+	defer rows.Close()
+
+	var transactions []Transaction
+
+	for rows.Next() {
+		var tx Transaction
+		if err := rows.Scan(&tx.ID, &tx.SetNumber, &tx.FromAccount, &tx.ToAccount, &tx.Amount); err != nil {
+			return fmt.Errorf("error scanning row: %v", err)
+		}
+		transactions = append(transactions, tx)
+	}
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	fmt.Printf("Transactions for Node %d:\n", nodeID)
+	fmt.Printf("%-10s | %-10s | %-12s | %-12s | %-10s\n", "ID", "SetNumber", "FromAccount", "ToAccount", "Amount")
+	fmt.Println("---------------------------------------------------------------")
+	for _, tx := range transactions {
+		fmt.Printf("%-10d | %-10d | %-12d | %-12d | %-10d\n", tx.ID, tx.SetNumber, tx.FromAccount, tx.ToAccount, tx.Amount)
+	}
+
+	// return transactions, nil
+	return nil
+}
 func main() {
-	// Initialize variables to track the current set being sent and whether all sets have been read
+
 	var currentSetNumber = 1
 	var allSetsRead = false
 
-	// Infinite loop for continuously taking user input
 	for {
-		// Display menu options
+
 		fmt.Println("\nSelect an option:")
 		fmt.Println("1. Read Transaction SET on Default Path")
 		fmt.Println("2. Send Transactions (Next Set)")
-		fmt.Println("3. Kill Nodes")
+		fmt.Println("3. PrintLog of a given Server")
 		fmt.Println("4. Print Balance on Specific Server")
-		fmt.Println("5. Spawn All Nodes")
-		fmt.Println("6. Exit")
+		fmt.Println("5. Print DB of a Specific Server")
+		fmt.Println("6. BONUS Print Balance")
+		fmt.Println("7. Print Latency of a server")
+		fmt.Println("8. Exit")
 
-		// Read user's choice
 		var option int
 		fmt.Print("Enter your option: ")
 		_, err := fmt.Scanln(&option)
@@ -158,7 +203,6 @@ func main() {
 			continue
 		}
 
-		// Handle user input with a switch-case
 		switch option {
 		case 1:
 			// Read the transactions from the default CSV file path
@@ -173,7 +217,7 @@ func main() {
 			fmt.Println("Transactions successfully read.")
 
 		case 2:
-			// Send transactions from the current set number
+
 			if !allSetsRead {
 				fmt.Println("No transactions have been read. Please choose option 1 first.")
 				continue
@@ -195,7 +239,7 @@ func main() {
 					wg2.Add(1)
 					if previouslyKilledServers[serverID] && aliveServerSet[serverID] {
 						fmt.Printf("Reviving Server %d for this set\n", serverID)
-						// // Placeholder for Revive logic, you will implement it later
+
 						c, ctx, conn := setUPClientRPC(serverID)
 						ack, err := c.Revive(ctx, &pb.ReviveRequest{NodeID: int32(serverID)})
 						if err != nil {
@@ -231,10 +275,8 @@ func main() {
 				// wg.Add(len(transactions))
 				sort.Slice(transactions, func(i, j int) bool {
 					if transactions[i].From == transactions[j].From {
-						// If the transactions are from the same server, sort by Id
 						return transactions[i].Id < transactions[j].Id
 					}
-					// Otherwise, we don't care about the order between different 'From' servers
 					return false
 				})
 				fmt.Println("Current transactions Order")
@@ -242,13 +284,11 @@ func main() {
 				for _, tran := range transactions {
 					wg2.Add(1)
 					serverID := int(tran.From)
-					serverMutex := getServerMutex(serverID) // Get the mutex for the specific server
-					// fmt.Println("Oiled up Transaction ", tran)
+					serverMutex := getServerMutex(serverID)
 					go func(tran *pb.TransactionRequest, serverMutex *sync.Mutex) {
 						serverMutex.Lock()
-						defer serverMutex.Unlock() // Unlock when done
+						defer serverMutex.Unlock()
 
-						// Set up RPC connection and send the transaction to the appropriate server
 						c, ctx, conn := setUPClientRPC(serverID)
 						defer conn.Close()
 						fmt.Println("Sending Transaction ", tran)
@@ -259,7 +299,7 @@ func main() {
 						}
 						log.Printf("Transaction Sent from Server %d: %s", serverID, r.Ack)
 
-					}(tran, serverMutex) // Pass the transaction and serverMutex to the goroutine
+					}(tran, serverMutex)
 					time.Sleep(2 * time.Millisecond)
 					wg2.Done()
 				}
@@ -268,23 +308,35 @@ func main() {
 
 				// time.Sleep(400 * time.Millisecond)
 				fmt.Println("Done Waiting")
-				currentSetNumber++ // Move to the next set
+				currentSetNumber++
 			} else {
 				fmt.Println("No more sets to send.")
 			}
 
 		case 3:
-			// Example for killing nodes
-			c, ctx, conn := setUPClientRPC(1)
-			r, err := c.Kill(ctx, &pb.AdminRequest{Command: "Die and Perish"})
+			var option int
+			fmt.Print("Enter the Server for which you want to print local logs ")
+			_, err := fmt.Scanln(&option)
 			if err != nil {
-				log.Fatalf("Could not kill: %v", err)
+				fmt.Println("Invalid input, please enter a number.")
+				continue
 			}
-			log.Printf("Kill Command Sent: %s", r.Ack)
+			c, ctx, conn := setUPClientRPC(option)
+			r, err := c.PrintLogs(ctx, &pb.PrintLogRequest{})
+			if err != nil {
+				log.Fatalf("Could not retrieve balance: %v", err)
+			}
+			fmt.Printf("Below are the logs of Server %d:\n", option)
+			fmt.Printf("%-10s | %-10s | %-12s | %-12s | %-10s\n", "ID", "SetNumber", "FromAccount", "ToAccount", "Amount")
+			fmt.Println("---------------------------------------------------------------")
+			for _, tx := range r.Logs {
+				fmt.Printf("%-10d | %-10d | S%-11d | S%-11d | %-10d\n", tx.Id, tx.SetNumber, tx.From, tx.To, tx.Amount)
+			}
+
 			conn.Close()
 
 		case 4:
-			// Example for printing balances from each node
+
 			for i := 1; i <= 5; i++ {
 				c, ctx, conn := setUPClientRPC(i)
 				r, err := c.GetBalance(ctx, &pb.AdminRequest{Command: "Requesting Balance"})
@@ -296,18 +348,146 @@ func main() {
 			}
 
 		case 5:
-			// Placeholder for spawning all nodes
-			fmt.Println("Executing: Spawn All Nodes")
-			// Add node spawning logic here if required
+
+			var option int
+			fmt.Println("Which server db do you want to read")
+			_, err := fmt.Scanln(&option)
+			if err != nil {
+				fmt.Println("Invalid input, please enter a number.")
+				continue
+			}
+			fmt.Println("Executing: Read Database of a specific node")
+			ReadDBTransactions(option)
 
 		case 6:
-			// Exit the program
+			var serverID int
+
+			fmt.Print("Enter the Server ID (1-5): ")
+			fmt.Scanln(&serverID)
+
+			balance := getBalanceForSpecificServer(serverID, currentSetNumber)
+			fmt.Printf("Current balance for server %d: %d\n", serverID, balance)
+
+		case 7:
+			var option int
+			fmt.Println("Which Server Latency Do you want to see")
+			_, err := fmt.Scanln(&option)
+			if err != nil {
+				fmt.Println("Invalid input, please enter a number.")
+				continue
+			}
+			c, ctx, conn := setUPClientRPC(option)
+			latencies, err := c.GetLatencies(ctx, &pb.EmptyRequest{})
+			if err != nil {
+				fmt.Println("Error fetching latencies:", err)
+				continue
+			}
+
+			fmt.Println("Transaction Latency Details:")
+			for _, record := range latencies.Latencies {
+				fmt.Printf("Transaction ID: %d, From: %d, To: %d, Amount: %d, Latency: %s\n",
+					record.Id, record.From, record.To, record.Amount, record.Latency)
+			}
+
+			if len(latencies.Latencies) > 0 {
+
+				totalLatency := time.Duration(0)
+				var totalThroughput float64 = 0
+				for _, record := range latencies.Latencies {
+					latencyDuration, _ := time.ParseDuration(record.Latency)
+					totalLatency += latencyDuration
+					latencyInSeconds := latencyDuration.Seconds()
+					if latencyInSeconds > 0 {
+						throughputPerTransaction := 1 / latencyInSeconds
+						fmt.Printf("Throughput : %.2f transactions per second\n", throughputPerTransaction)
+						totalThroughput += throughputPerTransaction
+					}
+				}
+				avgLatency := totalLatency / time.Duration(len(latencies.Latencies))
+				fmt.Printf("\nAverage Latency: %v\n", avgLatency)
+				fmt.Printf("Total Throughput: %.2f transactions per second\n", totalThroughput)
+			} else {
+				fmt.Println("\nNo transactions to calculate average latency.")
+			}
+
+			conn.Close()
+
+		case 8:
 			fmt.Println("Exiting program...")
 			os.Exit(0)
-
 		default:
-			// Invalid option handling
+
 			fmt.Println("Invalid option. Please choose a valid number.")
 		}
 	}
+}
+
+func getBalanceForSpecificServer(serverID int, currentSetNumber int) int {
+	// A set to track processed transaction IDs (to avoid duplicates)
+	processedTxnIds := make(map[int]bool)
+
+	initialBalance := 100
+	finalBalance := initialBalance
+	var longestCommittedLog []*pb.TransactionRequest
+
+	// Get the list of alive servers for the current set
+	aliveServers := liveServersMap[currentSetNumber]
+
+	// Iterate over all alive servers to find the most up-to-date committed log
+	for _, aliveServerID := range aliveServers {
+
+		c, ctx, conn := setUPClientRPC(aliveServerID)
+		defer conn.Close()
+
+		response, err := c.PrintLogs(ctx, &pb.PrintLogRequest{})
+		if err != nil {
+			fmt.Printf("Error fetching logs from server %d: %v\n", aliveServerID, err)
+			continue
+		}
+
+		// Checking if this server has the longest committed log
+		if len(response.CommitedLogs) > len(longestCommittedLog) {
+			longestCommittedLog = response.CommitedLogs
+		}
+	}
+
+	// Apply the longest committed log
+	for _, txn := range longestCommittedLog {
+
+		if (txn.From == int32(serverID) || txn.To == int32(serverID)) && !processedTxnIds[int(txn.Id)] {
+			finalBalance = applyTransaction(finalBalance, txn, serverID)
+			processedTxnIds[int(txn.Id)] = true
+		}
+	}
+
+	for _, aliveServerID := range aliveServers {
+
+		c, ctx, conn := setUPClientRPC(aliveServerID)
+		defer conn.Close()
+
+		response, err := c.PrintLogs(ctx, &pb.PrintLogRequest{})
+		if err != nil {
+			fmt.Printf("Error fetching logs from server %d: %v\n", aliveServerID, err)
+			continue
+		}
+
+		for _, txn := range response.Logs {
+			if (txn.From == int32(serverID) || txn.To == int32(serverID)) && !processedTxnIds[int(txn.Id)] {
+				finalBalance = applyTransaction(finalBalance, txn, serverID)
+				processedTxnIds[int(txn.Id)] = true
+			}
+		}
+	}
+
+	return finalBalance
+}
+
+func applyTransaction(balance int, txn *pb.TransactionRequest, clientId int) int {
+
+	if txn.From == int32(clientId) {
+		balance -= int(txn.Amount)
+	} else if txn.To == int32(clientId) {
+		balance += int(txn.Amount)
+	}
+	return balance
 }
